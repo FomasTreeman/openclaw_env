@@ -1,0 +1,55 @@
+# Virtual environment
+openclaw_env/
+
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.Python
+.venv/
+venv/
+*/venv/
+*/.venv/
+
+# Diagrams output
+*.png
+*.svg
+*.pdf
+*.dot
+
+# Terraform
+.terraform/
+.terraform.lock.hcl
+*.tfstate
+*.tfstate.*
+*.tfplan
+crash.log
+crash.*.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+.terraformrc
+terraform.rc
+
+# Generated Lambda zips
+lambda/*.zip
+
+# Sensitive files
+*.pem
+*.key
+.env
+.env.*
+secrets.auto.tfvars
+*.auto.tfvars
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
