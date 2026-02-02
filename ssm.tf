@@ -70,11 +70,11 @@ resource "aws_ssm_patch_group" "openclaw" {
 # Patches are applied during this window to minimize disruption.
 
 resource "aws_ssm_maintenance_window" "patching" {
-  name              = "openclaw-patching-window"
-  description       = "Weekly patching window for OpenClaw"
-  schedule          = "cron(0 4 ? * SUN *)" # Sunday 4 AM UTC
-  duration          = 2                       # 2 hours
-  cutoff            = 1                       # Stop 1 hour before end
+  name                       = "openclaw-patching-window"
+  description                = "Weekly patching window for OpenClaw"
+  schedule                   = "cron(0 4 ? * SUN *)" # Sunday 4 AM UTC
+  duration                   = 2                     # 2 hours
+  cutoff                     = 1                     # Stop 1 hour before end
   allow_unassociated_targets = false
 
   tags = {
