@@ -13,7 +13,7 @@ permissions:
 
 jobs:
   # ==========================================================================
-  # VALIDATION JOBS - Run all checks and collect results
+  # VALIDATION JOBS - Run all checks, fail on any issues (errors or warnings)
   # ==========================================================================
 
   terraform:
@@ -22,7 +22,7 @@ jobs:
     outputs:
       validate_status: ${{ steps.validate.outcome }}
       fmt_status: ${{ steps.fmt.outcome }}
-      fmt_diff: ${{ steps.fmt.outputs.diff }}
+      has_issues: ${{ steps.fmt.outcome == 'failure' || steps.validate.outcome == 'failure' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -37,15 +37,22 @@ jobs:
         id: fmt
         continue-on-error: true
         run: |
-          if ! terraform fmt -check -recursive -diff > fmt_diff.txt 2>&1; then
-            echo "diff=true" >> $GITHUB_OUTPUT
-            cat fmt_diff.txt
+          OUTPUT=$(terraform fmt -check -recursive -diff 2>&1)
+          if [[ -n "$OUTPUT" ]]; then
+            echo "$OUTPUT"
+            echo "$OUTPUT" > fmt_diff.txt
+            echo "::error::Terraform formatting issues found"
             exit 1
           fi
 
       - name: Terraform Validate
         id: validate
-        run: terraform validate
+        continue-on-error: true
+        run: |
+          if ! terraform validate; then
+            echo "::error::Terraform validation failed"
+            exit 1
+          fi
 
       - name: Upload format diff
         if: steps.fmt.outcome == 'failure'
@@ -59,32 +66,50 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       status: ${{ steps.scan.outcome }}
+      has_issues: ${{ steps.check.outputs.has_issues }}
     steps:
       - uses: actions/checkout@v4
 
       - name: Run Checkov
         id: scan
-        uses: bridgecrewio/checkov-action@v12
         continue-on-error: true
-        with:
-          directory: .
-          framework: terraform
-          output_format: cli,sarif
-          output_file_path: console,checkov-results.sarif
-          soft_fail: true
+        run: |
+          pip install checkov
+          # Run checkov and capture output
+          checkov -d . --framework terraform --output cli --output json --output-file-path console,checkov-results.json 2>&1 | tee checkov-output.txt
+          EXIT_CODE=${PIPESTATUS[0]}
+          echo "exit_code=$EXIT_CODE" >> $GITHUB_OUTPUT
 
-      - name: Upload SARIF
+      - name: Check for issues
+        id: check
+        run: |
+          if [[ -f checkov-results.json ]]; then
+            FAILED=$(cat checkov-results.json | jq '.results.failed_checks | length' 2>/dev/null || echo "0")
+            if [[ "$FAILED" -gt 0 ]]; then
+              echo "::warning::Checkov found $FAILED security issues"
+              echo "has_issues=true" >> $GITHUB_OUTPUT
+            else
+              echo "has_issues=false" >> $GITHUB_OUTPUT
+            fi
+          else
+            echo "has_issues=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Upload results
         if: always()
-        uses: github/codeql-action/upload-sarif@v3
-        continue-on-error: true
+        uses: actions/upload-artifact@v4
         with:
-          sarif_file: checkov-results.sarif
+          name: checkov-results
+          path: |
+            checkov-results.json
+            checkov-output.txt
 
   tflint:
     name: TFLint
     runs-on: ubuntu-latest
     outputs:
       status: ${{ steps.lint.outcome }}
+      has_issues: ${{ steps.lint.outcome == 'failure' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -98,13 +123,20 @@ jobs:
       - name: Run TFLint
         id: lint
         continue-on-error: true
-        run: tflint --format compact
+        run: |
+          OUTPUT=$(tflint --format compact 2>&1)
+          if [[ -n "$OUTPUT" ]]; then
+            echo "$OUTPUT"
+            echo "::error::TFLint found issues"
+            exit 1
+          fi
 
   gitleaks:
     name: Secret Detection
     runs-on: ubuntu-latest
     outputs:
       status: ${{ steps.scan.outcome }}
+      has_issues: ${{ steps.scan.outcome == 'failure' }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -122,6 +154,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       status: ${{ steps.scan.outcome }}
+      has_issues: ${{ steps.scan.outcome == 'failure' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -132,7 +165,7 @@ jobs:
         with:
           scan-type: 'fs'
           scan-ref: '.'
-          severity: 'CRITICAL,HIGH'
+          severity: 'CRITICAL,HIGH,MEDIUM'
           format: 'table'
           exit-code: '1'
 
@@ -141,6 +174,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       status: ${{ steps.lint.outcome }}
+      has_issues: ${{ steps.lint.outcome == 'failure' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -156,10 +190,15 @@ jobs:
       - name: Run Ansible Lint
         id: lint
         continue-on-error: true
-        run: ansible-lint ansible/playbook.yml
+        run: |
+          # Fail on any violations (errors or warnings)
+          if ! ansible-lint ansible/playbook.yml --strict; then
+            echo "::error::Ansible Lint found issues"
+            exit 1
+          fi
 
   # ==========================================================================
-  # SUMMARY JOB - Report results and optionally create fix PR
+  # SUMMARY JOB - Report ALL issues and trigger auto-fix
   # ==========================================================================
 
   summary:
@@ -167,6 +206,9 @@ jobs:
     runs-on: ubuntu-latest
     needs: [terraform, checkov, tflint, gitleaks, trivy, ansible]
     if: always()
+    outputs:
+      any_failed: ${{ steps.summary.outputs.any_failed }}
+      fixable_failed: ${{ steps.summary.outputs.fixable_failed }}
     steps:
       - uses: actions/checkout@v4
 
@@ -175,80 +217,110 @@ jobs:
         run: |
           echo "## Security & Quality Check Results" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "| Check | Status |" >> $GITHUB_STEP_SUMMARY
-          echo "|-------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Check | Status | Auto-Fixable |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|--------|--------------|" >> $GITHUB_STEP_SUMMARY
           
-          # Function to convert outcome to emoji
-          status_emoji() {
-            case "$1" in
-              success) echo "✅ Passed" ;;
-              failure) echo "❌ Failed" ;;
-              skipped) echo "⏭️ Skipped" ;;
-              *) echo "❓ Unknown" ;;
-            esac
-          }
+          ANY_FAILED="false"
+          FIXABLE_FAILED="false"
           
-          echo "| Terraform Validate | $(status_emoji '${{ needs.terraform.outputs.validate_status }}') |" >> $GITHUB_STEP_SUMMARY
-          echo "| Terraform Format | $(status_emoji '${{ needs.terraform.outputs.fmt_status }}') |" >> $GITHUB_STEP_SUMMARY
-          echo "| Checkov Security | $(status_emoji '${{ needs.checkov.outputs.status }}') |" >> $GITHUB_STEP_SUMMARY
-          echo "| TFLint | $(status_emoji '${{ needs.tflint.outputs.status }}') |" >> $GITHUB_STEP_SUMMARY
-          echo "| Gitleaks Secrets | $(status_emoji '${{ needs.gitleaks.outputs.status }}') |" >> $GITHUB_STEP_SUMMARY
-          echo "| Trivy Vulnerabilities | $(status_emoji '${{ needs.trivy.outputs.status }}') |" >> $GITHUB_STEP_SUMMARY
-          echo "| Ansible Lint | $(status_emoji '${{ needs.ansible.outputs.status }}') |" >> $GITHUB_STEP_SUMMARY
+          # Terraform Validate
+          if [[ "${{ needs.terraform.outputs.validate_status }}" == "failure" ]]; then
+            echo "| Terraform Validate | ❌ Failed | No |" >> $GITHUB_STEP_SUMMARY
+            ANY_FAILED="true"
+          else
+            echo "| Terraform Validate | ✅ Passed | - |" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          # Terraform Format
+          if [[ "${{ needs.terraform.outputs.fmt_status }}" == "failure" ]]; then
+            echo "| Terraform Format | ❌ Failed | ✅ Yes |" >> $GITHUB_STEP_SUMMARY
+            ANY_FAILED="true"
+            FIXABLE_FAILED="true"
+          else
+            echo "| Terraform Format | ✅ Passed | - |" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          # Checkov
+          if [[ "${{ needs.checkov.outputs.has_issues }}" == "true" ]]; then
+            echo "| Checkov Security | ⚠️ Issues Found | No |" >> $GITHUB_STEP_SUMMARY
+            ANY_FAILED="true"
+          else
+            echo "| Checkov Security | ✅ Passed | - |" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          # TFLint
+          if [[ "${{ needs.tflint.outputs.status }}" == "failure" ]]; then
+            echo "| TFLint | ❌ Failed | ✅ Yes |" >> $GITHUB_STEP_SUMMARY
+            ANY_FAILED="true"
+            FIXABLE_FAILED="true"
+          else
+            echo "| TFLint | ✅ Passed | - |" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          # Gitleaks
+          if [[ "${{ needs.gitleaks.outputs.status }}" == "failure" ]]; then
+            echo "| Gitleaks Secrets | 🚨 SECRETS FOUND | No |" >> $GITHUB_STEP_SUMMARY
+            ANY_FAILED="true"
+          else
+            echo "| Gitleaks Secrets | ✅ Passed | - |" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          # Trivy
+          if [[ "${{ needs.trivy.outputs.status }}" == "failure" ]]; then
+            echo "| Trivy Vulnerabilities | ⚠️ Issues Found | No |" >> $GITHUB_STEP_SUMMARY
+            ANY_FAILED="true"
+          else
+            echo "| Trivy Vulnerabilities | ✅ Passed | - |" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          # Ansible
+          if [[ "${{ needs.ansible.outputs.status }}" == "failure" ]]; then
+            echo "| Ansible Lint | ❌ Failed | ✅ Yes |" >> $GITHUB_STEP_SUMMARY
+            ANY_FAILED="true"
+            FIXABLE_FAILED="true"
+          else
+            echo "| Ansible Lint | ✅ Passed | - |" >> $GITHUB_STEP_SUMMARY
+          fi
+          
           echo "" >> $GITHUB_STEP_SUMMARY
           
-          # Determine if any critical checks failed
-          FAILED=""
-          if [[ "${{ needs.terraform.outputs.validate_status }}" == "failure" ]]; then
-            FAILED="${FAILED}terraform-validate,"
-          fi
-          if [[ "${{ needs.gitleaks.outputs.status }}" == "failure" ]]; then
-            FAILED="${FAILED}gitleaks,"
-          fi
+          # Output summary
+          echo "any_failed=$ANY_FAILED" >> $GITHUB_OUTPUT
+          echo "fixable_failed=$FIXABLE_FAILED" >> $GITHUB_OUTPUT
           
-          if [[ -n "$FAILED" ]]; then
-            echo "### ⛔ Critical Failures" >> $GITHUB_STEP_SUMMARY
-            echo "The following critical checks failed: ${FAILED%,}" >> $GITHUB_STEP_SUMMARY
-            echo "These must be fixed before merging." >> $GITHUB_STEP_SUMMARY
-            echo "has_critical_failures=true" >> $GITHUB_OUTPUT
-          else
-            echo "has_critical_failures=false" >> $GITHUB_OUTPUT
-          fi
-          
-          # Check for auto-fixable issues
-          FIXABLE=""
-          if [[ "${{ needs.terraform.outputs.fmt_status }}" == "failure" ]]; then
-            FIXABLE="${FIXABLE}terraform-fmt,"
-          fi
-          
-          if [[ -n "$FIXABLE" ]]; then
+          if [[ "$ANY_FAILED" == "true" ]]; then
+            echo "### ⚠️ Issues Detected" >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
-            echo "### 🔧 Auto-Fixable Issues" >> $GITHUB_STEP_SUMMARY
-            echo "The following can be automatically fixed: ${FIXABLE%,}" >> $GITHUB_STEP_SUMMARY
-            echo "has_fixable=true" >> $GITHUB_OUTPUT
+            if [[ "$FIXABLE_FAILED" == "true" ]]; then
+              echo "Some issues can be auto-fixed. A PR will be created with fixes." >> $GITHUB_STEP_SUMMARY
+            fi
+            if [[ "${{ needs.gitleaks.outputs.status }}" == "failure" ]]; then
+              echo "" >> $GITHUB_STEP_SUMMARY
+              echo "🚨 **CRITICAL: Secrets detected in code! This must be fixed manually.**" >> $GITHUB_STEP_SUMMARY
+            fi
           else
-            echo "has_fixable=false" >> $GITHUB_OUTPUT
+            echo "### ✅ All Checks Passed" >> $GITHUB_STEP_SUMMARY
           fi
 
-      - name: Fail if critical issues
-        if: steps.summary.outputs.has_critical_failures == 'true'
+      - name: Fail workflow if issues found
+        if: steps.summary.outputs.any_failed == 'true'
         run: |
-          echo "Critical security checks failed. See summary above."
+          echo "::error::One or more checks failed. See summary for details."
           exit 1
 
   # ==========================================================================
-  # AUTO-FIX JOB - Create PR with fixes for auto-fixable issues
+  # AUTO-FIX JOB - Always attempt fixes when fixable checks fail
   # ==========================================================================
 
   auto-fix:
     name: Auto-Fix & Create PR
     runs-on: ubuntu-latest
-    needs: [terraform, checkov, tflint, ansible, summary]
+    needs: [terraform, tflint, ansible, summary]
     if: |
       always() &&
       github.event_name == 'push' &&
       github.ref == 'refs/heads/main' &&
-      (needs.terraform.outputs.fmt_status == 'failure' || needs.tflint.outputs.status == 'failure')
+      needs.summary.outputs.fixable_failed == 'true'
     steps:
       - uses: actions/checkout@v4
         with:
@@ -262,23 +334,53 @@ jobs:
         with:
           tflint_version: latest
 
-      - name: Apply Terraform Format
-        if: needs.terraform.outputs.fmt_status == 'failure'
-        run: terraform fmt -recursive
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install ansible ansible-lint
+
+      - name: Terraform Init
+        run: terraform init -backend=false
+
+      - name: Apply Terraform Format Fixes
+        run: |
+          echo "Applying terraform fmt..."
+          terraform fmt -recursive
+          git diff --stat
 
       - name: Apply TFLint Fixes
-        if: needs.tflint.outputs.status == 'failure'
         run: |
+          echo "Applying tflint fixes..."
           tflint --init
           tflint --fix || true
+          git diff --stat
+
+      - name: Apply Ansible Lint Fixes
+        run: |
+          echo "Applying ansible-lint fixes..."
+          ansible-galaxy collection install -r ansible/requirements.yml
+          ansible-lint ansible/playbook.yml --fix || true
+          # Also fix any yaml formatting
+          ansible-lint ansible/*.yml --fix || true
+          git diff --stat
 
       - name: Check for changes
         id: changes
         run: |
+          git diff --stat
           if [[ -n "$(git status --porcelain)" ]]; then
             echo "has_changes=true" >> $GITHUB_OUTPUT
+            echo "### 🔧 Auto-fix changes:" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            git status --short >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
           else
             echo "has_changes=false" >> $GITHUB_OUTPUT
+            echo "### ℹ️ No auto-fixable changes" >> $GITHUB_STEP_SUMMARY
+            echo "The issues found require manual intervention." >> $GITHUB_STEP_SUMMARY
           fi
 
       - name: Create Pull Request
@@ -289,22 +391,35 @@ jobs:
           commit-message: "chore: auto-fix linting and formatting issues"
           title: "🔧 Auto-fix: Linting and formatting corrections"
           body: |
-            ## Automated Fixes
-            
-            This PR contains automatic fixes for the following issues detected in CI:
-            
-            ${{ needs.terraform.outputs.fmt_status == 'failure' && '- ✅ Terraform formatting (`terraform fmt`)' || '' }}
-            ${{ needs.tflint.outputs.status == 'failure' && '- ✅ TFLint auto-fixable issues' || '' }}
-            
-            ### Review Checklist
-            - [ ] Changes look correct
-            - [ ] No unintended modifications
-            - [ ] CI passes on this PR
-            
+            ## Automated Fixes Applied
+
+            This PR contains automatic fixes for issues detected by CI.
+
+            ### Fixes Applied
+            - Terraform formatting (`terraform fmt -recursive`)
+            - TFLint auto-fixes (`tflint --fix`)
+            - Ansible Lint auto-fixes (`ansible-lint --fix`)
+
+            ### What to Review
+            - [ ] Verify the changes are correct
+            - [ ] Ensure no unintended modifications
+            - [ ] Check that CI passes on this PR
+
+            ### Issues NOT Fixed (require manual attention)
+            - Checkov security findings (review and fix manually)
+            - Trivy vulnerability findings (update dependencies)
+            - Any secret detection issues (remove secrets immediately)
+
             ---
-            *This PR was automatically generated by the security workflow.*
-          branch: auto-fix/linting-${{ github.sha }}
+            *Automatically generated by the security workflow.*
+            *Triggered by: ${{ github.sha }}*
+          branch: auto-fix/ci-${{ github.run_number }}
           delete-branch: true
           labels: |
             automated
-            linting
+            ci-fix
+
+      - name: Summary if no PR created
+        if: steps.changes.outputs.has_changes == 'false'
+        run: |
+          echo "::warning::Issues were detected but none could be auto-fixed. Manual intervention required."

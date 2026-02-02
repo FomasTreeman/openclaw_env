@@ -13,7 +13,7 @@
 # 5. Sets up systemd service with security hardening
 #
 # Prerequisites:
-#   ansible-galaxy collection install community.general
+#   ansible-galaxy collection install -r requirements.yml
 #
 # Usage:
 #   ansible-playbook playbook.yml -i inventory.yml
@@ -23,7 +23,7 @@
 ---
 - name: Configure AI Agent Server
   hosts: all
-  become: yes
+  become: true
 
   vars:
     service_user: aiagent
@@ -37,7 +37,7 @@
     # =========================================================================
     - name: Update apt cache
       ansible.builtin.apt:
-        update_cache: yes
+        update_cache: true
         cache_valid_time: 3600
 
     - name: Upgrade all packages
@@ -80,7 +80,7 @@
     - name: Enable fail2ban
       ansible.builtin.systemd:
         name: fail2ban
-        enabled: yes
+        enabled: true
         state: started
 
     # =========================================================================
@@ -100,13 +100,13 @@
       ansible.builtin.file:
         path: /etc/apt/keyrings
         state: directory
-        mode: '0755'
+        mode: "0755"
 
     - name: Add Docker GPG key
       ansible.builtin.get_url:
         url: https://download.docker.com/linux/ubuntu/gpg
         dest: /etc/apt/keyrings/docker.asc
-        mode: '0644'
+        mode: "0644"
 
     - name: Add Docker repository
       ansible.builtin.apt_repository:
@@ -121,33 +121,38 @@
           - containerd.io
           - docker-compose-plugin
         state: present
-        update_cache: yes
+        update_cache: true
 
     - name: Start Docker
       ansible.builtin.systemd:
         name: docker
-        enabled: yes
+        enabled: true
         state: started
 
     # =========================================================================
     # NODE.JS + PNPM
     # =========================================================================
-    - name: Add NodeSource repository
-      ansible.builtin.shell: |
-        curl -fsSL https://deb.nodesource.com/setup_{{ node_version }}.x | bash -
-      args:
+    - name: Download NodeSource setup script
+      ansible.builtin.get_url:
+        url: "https://deb.nodesource.com/setup_{{ node_version }}.x"
+        dest: /tmp/nodesource_setup.sh
+        mode: "0755"
+
+    - name: Run NodeSource setup script
+      ansible.builtin.command:
+        cmd: /tmp/nodesource_setup.sh
         creates: /etc/apt/sources.list.d/nodesource.list
 
     - name: Install Node.js
       ansible.builtin.apt:
         name: nodejs
         state: present
-        update_cache: yes
+        update_cache: true
 
     - name: Install pnpm globally
       community.general.npm:
         name: pnpm
-        global: yes
+        global: true
 
     # =========================================================================
     # SERVICE USER (Unprivileged)
@@ -157,14 +162,14 @@
         name: "{{ service_user }}"
         home: "{{ service_home }}"
         shell: /bin/bash
-        system: yes
-        create_home: yes
+        system: true
+        create_home: true
 
     - name: Add service user to docker group
       ansible.builtin.user:
         name: "{{ service_user }}"
         groups: docker
-        append: yes
+        append: true
 
     # =========================================================================
     # APPLICATION DIRECTORY
@@ -175,14 +180,14 @@
         state: directory
         owner: "{{ service_user }}"
         group: "{{ service_user }}"
-        mode: '0755'
+        mode: "0755"
 
     - name: Create placeholder start script
       ansible.builtin.copy:
         dest: "{{ service_home }}/app/start.sh"
         owner: "{{ service_user }}"
         group: "{{ service_user }}"
-        mode: '0755'
+        mode: "0755"
         content: |
           #!/bin/bash
           # Placeholder startup script
@@ -199,7 +204,7 @@
     - name: Create systemd service
       ansible.builtin.copy:
         dest: /etc/systemd/system/aiagent.service
-        mode: '0644'
+        mode: "0644"
         content: |
           [Unit]
           Description=AI Agent Gateway
@@ -229,12 +234,12 @@
 
     - name: Reload systemd
       ansible.builtin.systemd:
-        daemon_reload: yes
+        daemon_reload: true
 
     - name: Enable service (but don't start - needs configuration)
       ansible.builtin.systemd:
         name: aiagent
-        enabled: yes
+        enabled: true
 
     # =========================================================================
     # CLOUDWATCH AGENT (Optional - for log shipping)
@@ -243,7 +248,7 @@
       ansible.builtin.get_url:
         url: https://s3.amazonaws.com/amazoncloudwatch-agent/ubuntu/amd64/latest/amazon-cloudwatch-agent.deb
         dest: /tmp/amazon-cloudwatch-agent.deb
-        mode: '0644'
+        mode: "0644"
 
     - name: Install CloudWatch agent
       ansible.builtin.apt:
@@ -256,7 +261,7 @@
       ansible.builtin.debug:
         msg: |
           Server configured successfully!
-          
+
           Next steps:
           1. Deploy your AI agent application to {{ service_home }}/app/
           2. Update start.sh with your application startup command
