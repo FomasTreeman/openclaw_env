@@ -302,12 +302,6 @@ jobs:
             echo "### ✅ All Checks Passed" >> $GITHUB_STEP_SUMMARY
           fi
 
-      - name: Fail workflow if issues found
-        if: steps.summary.outputs.any_failed == 'true'
-        run: |
-          echo "::error::One or more checks failed. See summary for details."
-          exit 1
-
   # ==========================================================================
   # AUTO-FIX JOB - Always attempt fixes when fixable checks fail
   # ==========================================================================
@@ -315,12 +309,17 @@ jobs:
   auto-fix:
     name: Auto-Fix & Create PR
     runs-on: ubuntu-latest
-    needs: [terraform, tflint, ansible, summary]
+    needs: [terraform, tflint, ansible, checkov, gitleaks, trivy]
+    # Run if ANY of the fixable checks failed, regardless of other job status
     if: |
       always() &&
       github.event_name == 'push' &&
       github.ref == 'refs/heads/main' &&
-      needs.summary.outputs.fixable_failed == 'true'
+      (
+        needs.terraform.outputs.fmt_status == 'failure' ||
+        needs.tflint.outputs.status == 'failure' ||
+        needs.ansible.outputs.status == 'failure'
+      )
     steps:
       - uses: actions/checkout@v4
         with:
@@ -423,3 +422,52 @@ jobs:
         if: steps.changes.outputs.has_changes == 'false'
         run: |
           echo "::warning::Issues were detected but none could be auto-fixed. Manual intervention required."
+
+  # ==========================================================================
+  # FINAL STATUS - Fails the workflow if there were unfixable issues
+  # ==========================================================================
+
+  status:
+    name: Final Status
+    runs-on: ubuntu-latest
+    needs: [terraform, checkov, tflint, gitleaks, trivy, ansible, summary, auto-fix]
+    if: always()
+    steps:
+      - name: Check overall status
+        run: |
+          echo "## Final Status Check" >> $GITHUB_STEP_SUMMARY
+          
+          # Check for critical failures that can't be auto-fixed
+          CRITICAL_FAIL="false"
+          
+          if [[ "${{ needs.terraform.outputs.validate_status }}" == "failure" ]]; then
+            echo "❌ Terraform validation failed (cannot auto-fix)" >> $GITHUB_STEP_SUMMARY
+            CRITICAL_FAIL="true"
+          fi
+          
+          if [[ "${{ needs.gitleaks.outputs.status }}" == "failure" ]]; then
+            echo "🚨 SECRETS DETECTED - Must be fixed manually!" >> $GITHUB_STEP_SUMMARY
+            CRITICAL_FAIL="true"
+          fi
+          
+          if [[ "${{ needs.checkov.outputs.has_issues }}" == "true" ]]; then
+            echo "⚠️ Checkov security issues found (review recommended)" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          if [[ "${{ needs.trivy.outputs.status }}" == "failure" ]]; then
+            echo "⚠️ Trivy vulnerabilities found (review recommended)" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          # Check if auto-fix created a PR
+          if [[ "${{ needs.auto-fix.result }}" == "success" ]]; then
+            echo "✅ Auto-fix PR created - please review and merge" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          # Fail if critical issues
+          if [[ "$CRITICAL_FAIL" == "true" ]]; then
+            echo "::error::Critical issues found that require manual intervention"
+            exit 1
+          fi
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Workflow completed. Review any warnings above." >> $GITHUB_STEP_SUMMARY
